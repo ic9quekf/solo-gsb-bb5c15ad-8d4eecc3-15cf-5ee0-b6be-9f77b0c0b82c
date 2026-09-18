@@ -27,12 +27,24 @@ CREATE TABLE IF NOT EXISTS consumers (
     lease_to_seq     INTEGER,                     -- 租约批次末尾 seq
     lease_expires_at TEXT                         -- 租约过期时间(UTC ISO8601)
 );
+
+CREATE TABLE IF NOT EXISTS retention_anchor (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),  -- 恒为单行
+    anchor_seq  INTEGER NOT NULL,                    -- 最后被压缩删除记录的 seq(初始 0 = 创世点)
+    anchor_hash TEXT NOT NULL                        -- 最后被压缩删除记录的 hash(初始为创世空串)
+);
 """
 
 
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # 压缩锚点初始化为创世点(seq=0 / 空串), 旧库启动时自动补建
+        conn.execute(
+            "INSERT OR IGNORE INTO retention_anchor (id, anchor_seq, anchor_hash)"
+            " VALUES (1, 0, ?)",
+            (GENESIS_HASH,),
+        )
         _migrate_chain_columns(conn)
         _backfill_chain(conn)
 

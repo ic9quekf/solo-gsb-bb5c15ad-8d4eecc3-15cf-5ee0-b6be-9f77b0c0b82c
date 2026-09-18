@@ -40,6 +40,11 @@ class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
 
 
+class CompactIn(BaseModel):
+    cutoff_seq: int = Field(..., ge=0)
+    dry_run: bool = False
+
+
 # ---------- helpers ----------
 
 def normalize_dt(dt: datetime) -> str:
@@ -86,7 +91,14 @@ def create_event(event: EventIn):
             row = conn.execute(
                 "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            prev_hash = row["hash"] if row else GENESIS_HASH
+            if row:
+                prev_hash = row["hash"]
+            else:
+                # 全部历史事件已被压缩: 新事件必须衔接压缩锚点而非创世点
+                anchor = conn.execute(
+                    "SELECT anchor_hash FROM retention_anchor WHERE id = 1"
+                ).fetchone()
+                prev_hash = anchor["anchor_hash"] if anchor else GENESIS_HASH
             cur = conn.execute(
                 "INSERT INTO events (event_id, occurred_at, payload, received_at)"
                 " VALUES (?, ?, ?, ?)",
@@ -330,6 +342,104 @@ def ack(
     }
 
 
+# ---------- retention: compaction ----------
+
+def _get_anchor(conn: sqlite3.Connection) -> tuple[int, str]:
+    row = conn.execute(
+        "SELECT anchor_seq, anchor_hash FROM retention_anchor WHERE id = 1"
+    ).fetchone()
+    # 旧库可能没有锚点行: 视为创世点
+    return (row["anchor_seq"], row["anchor_hash"]) if row else (0, GENESIS_HASH)
+
+
+def _safe_through_seq(conn: sqlite3.Connection) -> int:
+    """安全压缩边界: 有 consumer 时为所有已登记 consumer 游标最小值,
+    无 consumer 时为当前最大 seq(空库为 0)。"""
+    min_cursor = conn.execute("SELECT MIN(cursor_seq) AS m FROM consumers").fetchone()["m"]
+    if min_cursor is not None:
+        return min_cursor
+    return conn.execute("SELECT MAX(id) AS m FROM events").fetchone()["m"] or 0
+
+
+def _compact_conflict(safe_through_seq: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "cutoff_seq exceeds safe retention boundary",
+            "safe_through_seq": safe_through_seq,
+        },
+    )
+
+
+@app.post("/retention/compact")
+def retention_compact(req: CompactIn):
+    """安全归档(压缩)哈希链前缀:
+
+    - 只可压缩"当前锚点后一条 ~ cutoff_seq"的连续前缀, 即删除 (anchor_seq, cutoff_seq]。
+    - cutoff_seq 不得越过安全边界: 已登记 consumer 的最小 cursor_seq;
+      无 consumer 时以当前最大 seq 为界; 越界返回 409 并给出 safe_through_seq。
+    - 执行压缩时把最后删除记录的 seq/hash 持久化为新链锚点, 之后 /integrity 从锚点续校。
+    - dry_run 只返回预计删除数与边界, 不写库。
+    - 重复提交已覆盖区间幂等: 区间内已无记录, 删除数为 0, 锚点不变。
+    """
+    with get_conn() as conn:
+        anchor_seq, _ = _get_anchor(conn)
+        safe_through = _safe_through_seq(conn)
+        if req.cutoff_seq > safe_through:
+            return _compact_conflict(safe_through)
+
+        if req.dry_run:
+            would_delete = conn.execute(
+                "SELECT COUNT(*) AS c FROM events WHERE id > ? AND id <= ?",
+                (anchor_seq, req.cutoff_seq),
+            ).fetchone()["c"]
+            return {
+                "dry_run": True,
+                "anchor_seq": anchor_seq,
+                "cutoff_seq": req.cutoff_seq,
+                "safe_through_seq": safe_through,
+                "would_delete": would_delete,
+            }
+
+        # 与事件写入互斥: 写事务内重读边界, 防止与新事件写入/游标推进并发竞争
+        conn.execute("BEGIN IMMEDIATE")
+        anchor_seq, _ = _get_anchor(conn)
+        safe_through = _safe_through_seq(conn)
+        if req.cutoff_seq > safe_through:
+            # sqlite3 上下文管理器会提交; 此时尚未做任何修改, 提交无副作用
+            return _compact_conflict(safe_through)
+
+        # 待删区间的最后一条记录(seq 最大者)的 hash 即新链锚点
+        last = conn.execute(
+            "SELECT id, hash FROM events WHERE id > ? AND id <= ? ORDER BY id DESC"
+            " LIMIT 1",
+            (anchor_seq, req.cutoff_seq),
+        ).fetchone()
+        deleted = conn.execute(
+            "DELETE FROM events WHERE id > ? AND id <= ?",
+            (anchor_seq, req.cutoff_seq),
+        ).rowcount
+        if last is not None:
+            conn.execute(
+                "UPDATE retention_anchor SET anchor_seq = ?, anchor_hash = ?"
+                " WHERE id = 1",
+                (last["id"], last["hash"]),
+            )
+            anchor_seq, anchor_hash = last["id"], last["hash"]
+        else:
+            # 重复提交已覆盖区间(或 cutoff_seq 不超过锚点): 幂等空操作, 锚点不变
+            anchor_seq, anchor_hash = _get_anchor(conn)
+
+    return {
+        "dry_run": False,
+        "deleted": deleted,
+        "anchor_seq": anchor_seq,
+        "anchor_hash": anchor_hash,
+        "cutoff_seq": req.cutoff_seq,
+        "safe_through_seq": safe_through,
+    }
+
+
 def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str, Any]:
     return {
         "verified": False,
@@ -340,22 +450,28 @@ def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str
 
 @app.get("/integrity")
 def integrity():
-    """从最早记录开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。"""
+    """从压缩锚点之后继续校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。
+
+    被 /retention/compact 压缩掉的前缀以锚点(最后删除记录的 seq/hash)为信任起点,
+    因此第一条剩余记录的 prev_hash 必须等于锚点 hash; 全部事件已压缩(只剩锚点)时
+    仍返回 verified=true(checked=0)。无锚点时从创世点(seq=0 / 空串)校验全链。
+    """
     with get_conn() as conn:
+        anchor_seq, prev_hash = _get_anchor(conn)
         rows = conn.execute(
             "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
-            " FROM events ORDER BY id"
+            " FROM events WHERE id > ? ORDER BY id",
+            (anchor_seq,),
         ).fetchall()
 
     checked = 0
-    prev_seq: Optional[int] = None
-    prev_hash = GENESIS_HASH
+    prev_seq: Optional[int] = anchor_seq
     for row in rows:
         seq = row["id"]
-        # 序号连续性: 相邻记录 seq 必须逐一递增
-        if prev_seq is not None and seq != prev_seq + 1:
+        # 序号连续性: 剩余首条必须恰好是锚点后一条, 之后逐一递增
+        if seq != prev_seq + 1:
             return _chain_break(checked, seq, row["event_id"], "seq_gap")
-        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为创世空串)
+        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条剩余记录为锚点 hash)
         if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
             return _chain_break(checked, seq, row["event_id"], "prev_hash_mismatch")
         # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
