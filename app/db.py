@@ -27,7 +27,23 @@ CREATE TABLE IF NOT EXISTS consumers (
     lease_to_seq     INTEGER,                     -- 租约批次末尾 seq
     lease_expires_at TEXT                         -- 租约过期时间(UTC ISO8601)
 );
+
+CREATE TABLE IF NOT EXISTS chain_anchor (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),  -- 恒为 1 的单行表
+    anchor_seq  INTEGER NOT NULL,                    -- 已压缩归档到的最大 seq
+    anchor_hash TEXT NOT NULL                        -- 最后被压缩记录的哈希, 作为后续校验的 prev_hash 起点
+);
 """
+
+
+def get_chain_anchor(conn: sqlite3.Connection) -> tuple[int, str]:
+    """读取链锚点(压缩归档删到的最大 seq 及其哈希); 从未压缩时为 (0, 创世空串)。"""
+    row = conn.execute(
+        "SELECT anchor_seq, anchor_hash FROM chain_anchor WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return 0, GENESIS_HASH
+    return row["anchor_seq"], row["anchor_hash"]
 
 
 def init_db() -> None:
@@ -47,12 +63,16 @@ def _migrate_chain_columns(conn: sqlite3.Connection) -> None:
 
 
 def _backfill_chain(conn: sqlite3.Connection) -> None:
-    """为历史数据补齐哈希链(按首次接收顺序重算, 已有哈希的记录原样衔接)。"""
+    """为历史数据补齐哈希链(按首次接收顺序重算, 已有哈希的记录原样衔接)。
+
+    从链锚点之后开始: 已压缩归档的记录不在表内, 锚点哈希作为续链起点。
+    """
+    anchor_seq, prev_hash = get_chain_anchor(conn)
     rows = conn.execute(
         "SELECT id, event_id, occurred_at, payload, received_at, hash"
-        " FROM events ORDER BY id"
+        " FROM events WHERE id > ? ORDER BY id",
+        (anchor_seq,),
     ).fetchall()
-    prev_hash = GENESIS_HASH
     for row in rows:
         if row["hash"]:
             prev_hash = row["hash"]

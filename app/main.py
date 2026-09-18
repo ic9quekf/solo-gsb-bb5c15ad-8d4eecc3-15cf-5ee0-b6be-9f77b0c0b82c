@@ -8,8 +8,8 @@ from fastapi import Body, FastAPI, Path, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .chain import GENESIS_HASH, record_hash
-from .db import get_conn, init_db
+from .chain import record_hash
+from .db import get_chain_anchor, get_conn, init_db
 
 app = FastAPI(title="Webhook Event Receiver & Replay")
 
@@ -38,6 +38,11 @@ class PullIn(BaseModel):
 
 class AckIn(BaseModel):
     lease_token: str = Field(..., min_length=1, max_length=255)
+
+
+class CompactIn(BaseModel):
+    cutoff_seq: int = Field(..., ge=0)
+    dry_run: bool = False
 
 
 # ---------- helpers ----------
@@ -86,7 +91,11 @@ def create_event(event: EventIn):
             row = conn.execute(
                 "SELECT hash FROM events ORDER BY id DESC LIMIT 1"
             ).fetchone()
-            prev_hash = row["hash"] if row else GENESIS_HASH
+            if row:
+                prev_hash = row["hash"]
+            else:
+                # 事件表为空: 若曾压缩归档则从链锚点续链, 否则为创世空串
+                _, prev_hash = get_chain_anchor(conn)
             cur = conn.execute(
                 "INSERT INTO events (event_id, occurred_at, payload, received_at)"
                 " VALUES (?, ?, ?, ?)",
@@ -330,6 +339,111 @@ def ack(
     }
 
 
+# ---------- retention: 安全归档压缩 ----------
+
+@app.post("/retention/compact")
+def compact(req: CompactIn):
+    """压缩归档 (当前锚点, cutoff_seq] 的连续事件前缀。
+
+    - 安全边界: cutoff_seq 不得超过所有已登记 consumer 的最小 cursor_seq;
+      无 consumer 时以当前最大 seq 为边界。越界返回 409 并给出 safe_through_seq。
+    - 执行时持久化最后一条被删记录的 seq/hash 作为链锚点, /integrity 从锚点继续校验。
+    - dry_run=true 只返回预计删除数与边界, 不写库。
+    - cutoff_seq 已被既往压缩覆盖时为幂等空操作, 不再校验安全边界。
+    """
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        anchor_seq, anchor_hash = get_chain_anchor(conn)
+
+        # 安全边界: 已登记 consumer 的最小游标; 一个都没有时为当前最大 seq
+        row = conn.execute("SELECT MIN(cursor_seq) AS m FROM consumers").fetchone()
+        if row["m"] is not None:
+            safe_through_seq = row["m"]
+        else:
+            row = conn.execute("SELECT MAX(id) AS m FROM events").fetchone()
+            safe_through_seq = row["m"] or 0
+
+        # 幂等: 请求区间已被既往压缩覆盖, 无记录可删, 直接返回
+        if req.cutoff_seq <= anchor_seq:
+            result: dict[str, Any] = {
+                "dry_run": req.dry_run,
+                "from_seq": anchor_seq + 1,
+                "through_seq": anchor_seq,  # from > through 表示空区间
+                "safe_through_seq": safe_through_seq,
+            }
+            if req.dry_run:
+                return {"status": "dry_run", **result, "would_delete": 0}
+            return {
+                "status": "noop",
+                **result,
+                "deleted": 0,
+                "anchor_seq": anchor_seq,
+                "anchor_hash": anchor_hash,
+            }
+
+        if req.cutoff_seq > safe_through_seq:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "cutoff_seq exceeds safe retention boundary",
+                    "cutoff_seq": req.cutoff_seq,
+                    "safe_through_seq": safe_through_seq,
+                },
+            )
+
+        # 连续前缀: 从锚点后一条起逐条连续, 遇断档即止
+        rows = conn.execute(
+            "SELECT id, hash FROM events WHERE id > ? AND id <= ? ORDER BY id",
+            (anchor_seq, req.cutoff_seq),
+        ).fetchall()
+        prefix: list[sqlite3.Row] = []
+        expected = anchor_seq + 1
+        for r in rows:
+            if r["id"] != expected:
+                break
+            prefix.append(r)
+            expected += 1
+
+        from_seq = anchor_seq + 1
+        through_seq = prefix[-1]["id"] if prefix else anchor_seq
+
+        if req.dry_run:
+            # 只返回预计删除数与边界, 不写库
+            return {
+                "status": "dry_run",
+                "dry_run": True,
+                "would_delete": len(prefix),
+                "from_seq": from_seq,
+                "through_seq": through_seq,
+                "safe_through_seq": safe_through_seq,
+            }
+
+        if prefix:
+            conn.execute(
+                "DELETE FROM events WHERE id BETWEEN ? AND ?",
+                (from_seq, through_seq),
+            )
+            # 持久化链锚点: 最后一条被删记录的 seq/hash
+            anchor_seq, anchor_hash = through_seq, prefix[-1]["hash"]
+            conn.execute(
+                "INSERT INTO chain_anchor (id, anchor_seq, anchor_hash) VALUES (1, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET anchor_seq = excluded.anchor_seq,"
+                " anchor_hash = excluded.anchor_hash",
+                (anchor_seq, anchor_hash),
+            )
+
+        return {
+            "status": "compacted" if prefix else "noop",
+            "dry_run": False,
+            "deleted": len(prefix),
+            "from_seq": from_seq,
+            "through_seq": through_seq,
+            "anchor_seq": anchor_seq,
+            "anchor_hash": anchor_hash,
+            "safe_through_seq": safe_through_seq,
+        }
+
+
 def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str, Any]:
     return {
         "verified": False,
@@ -340,22 +454,28 @@ def _chain_break(checked: int, seq: int, event_id: str, reason: str) -> dict[str
 
 @app.get("/integrity")
 def integrity():
-    """从最早记录开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。"""
+    """从链锚点开始校验哈希链: 序号连续性、前后哈希衔接、记录内容哈希。
+
+    压缩归档后, 锚点(最后被删记录的 seq/hash)即校验起点; 全部事件已压缩时
+    没有待校验记录, 仍返回 verified=true。
+    """
     with get_conn() as conn:
+        anchor_seq, anchor_hash = get_chain_anchor(conn)
         rows = conn.execute(
             "SELECT id, event_id, occurred_at, payload, received_at, prev_hash, hash"
-            " FROM events ORDER BY id"
+            " FROM events WHERE id > ? ORDER BY id",
+            (anchor_seq,),
         ).fetchall()
 
     checked = 0
-    prev_seq: Optional[int] = None
-    prev_hash = GENESIS_HASH
+    prev_seq = anchor_seq
+    prev_hash = anchor_hash
     for row in rows:
         seq = row["id"]
-        # 序号连续性: 相邻记录 seq 必须逐一递增
-        if prev_seq is not None and seq != prev_seq + 1:
+        # 序号连续性: 相邻记录 seq 必须逐一递增(首条须为锚点 seq + 1)
+        if seq != prev_seq + 1:
             return _chain_break(checked, seq, row["event_id"], "seq_gap")
-        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为创世空串)
+        # 前后哈希衔接: prev_hash 必须等于上一条记录的 hash(首条为锚点哈希)
         if row["prev_hash"] is None or row["prev_hash"] != prev_hash:
             return _chain_break(checked, seq, row["event_id"], "prev_hash_mismatch")
         # 事件字段: 按固定 JSON 规范重算哈希并与存储值比对
@@ -372,4 +492,9 @@ def integrity():
         prev_seq = seq
         prev_hash = row["hash"]
 
-    return {"verified": True, "checked": checked, "first_break": None}
+    return {
+        "verified": True,
+        "checked": checked,
+        "first_break": None,
+        "anchor_seq": anchor_seq,
+    }

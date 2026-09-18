@@ -67,10 +67,10 @@ curl http://localhost:8000/integrity
 ```
 
 ```json
-{"verified": true, "checked": 3, "first_break": null}
+{"verified": true, "checked": 3, "first_break": null, "anchor_seq": 0}
 ```
 
-从最早记录开始逐条校验哈希链:**序号连续性**(相邻 `seq` 逐一递增)、**前后哈希衔接**(每条 `prev_hash` 等于上一条的 `hash`,首条 `prev_hash` 为空串)、**事件字段**(按固定 JSON 规范重算哈希比对)。空库返回 `verified=true`、`checked=0`。
+从**链锚点**开始逐条校验哈希链:**序号连续性**(相邻 `seq` 逐一递增,首条须为 `anchor_seq + 1`)、**前后哈希衔接**(每条 `prev_hash` 等于上一条的 `hash`,首条等于锚点哈希——未压缩过时为创世空串)、**事件字段**(按固定 JSON 规范重算哈希比对)。空库返回 `verified=true`、`checked=0`;全部事件被压缩归档后同样返回 `verified=true`、`checked=0`(锚点本身即完整性证明)。
 
 发现篡改时返回首个断点的 `seq`、`event_id` 和原因(`seq_gap` / `prev_hash_mismatch` / `hash_mismatch`),`checked` 为断点前已通过校验的记录数:
 
@@ -140,6 +140,58 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
   -H 'Content-Type: application/json' -d "{\"lease_token\":\"$TOKEN\"}"
 ```
 
+### 7. 安全归档压缩
+
+已确认消费的历史事件可压缩归档:物理删除 `(当前锚点, cutoff_seq]` 的连续事件前缀,并把最后一条被删记录的 `seq`/`hash` 持久化为**链锚点**,`/integrity` 之后从锚点继续校验,历史不可篡改性不受影响。
+
+```bash
+# 先演练: 只返回预计删除数与边界, 不写库
+curl -X POST http://localhost:8000/retention/compact \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff_seq":1000,"dry_run":true}'
+```
+
+```json
+{"status": "dry_run", "dry_run": true, "would_delete": 1000,
+ "from_seq": 1, "through_seq": 1000, "safe_through_seq": 1000}
+```
+
+```bash
+# 确认无误后真正执行
+curl -X POST http://localhost:8000/retention/compact \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff_seq":1000}'
+```
+
+```json
+{"status": "compacted", "dry_run": false, "deleted": 1000,
+ "from_seq": 1, "through_seq": 1000,
+ "anchor_seq": 1000, "anchor_hash": "9f2c…(64 位十六进制)",
+ "safe_through_seq": 1000}
+```
+
+**安全边界**:`cutoff_seq` 不得超过所有已登记 consumer 的**最小 `cursor_seq`**(未确认的事件绝不会被删);一个 consumer 都没有时以**当前最大 seq** 为边界。越界返回 **409** 并给出当前安全上界:
+
+```json
+{"detail": "cutoff_seq exceeds safe retention boundary",
+ "cutoff_seq": 1200, "safe_through_seq": 1000}
+```
+
+**幂等**:`cutoff_seq` 落在既往压缩已覆盖的区间(≤ 当前 `anchor_seq`)时返回 `{"status":"noop","deleted":0,…}`,不重复删除、不改变锚点;`dry_run` 任何时候都不写库。全部事件被压缩后,新写入的事件会从锚点哈希继续接链,`/integrity` 仍返回 `verified=true`。
+
+一个典型的演练-执行循环:
+
+```bash
+# 1) 演练, 确认预计删除数与边界
+curl -s -X POST http://localhost:8000/retention/compact \
+  -H 'Content-Type: application/json' -d '{"cutoff_seq":1000,"dry_run":true}'
+# 2) 执行
+curl -s -X POST http://localhost:8000/retention/compact \
+  -H 'Content-Type: application/json' -d '{"cutoff_seq":1000}'
+# 3) 校验链(从锚点继续)
+curl -s http://localhost:8000/integrity
+```
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -153,6 +205,8 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
 
 重复 `event_id` 的投递走幂等返回,不会写入记录,链保持不变。任何对历史记录的字段篡改、删除或重排都会被 `/integrity` 在首个断点处检出。
 
+**链锚点**:压缩归档删除的历史前缀由单行表 `chain_anchor` 记录——`anchor_seq`(已压缩到的最大 seq)与 `anchor_hash`(最后被删记录的哈希)。锚点之后的第一条现存记录必须 `seq = anchor_seq + 1` 且 `prev_hash = anchor_hash`;事件表为空时新写入的记录也从锚点哈希续链,因此压缩不会削弱后续记录的防篡改能力。
+
 **旧库迁移**:启动时自动为已有 SQLite 数据补加 `prev_hash`/`hash` 列并按首次接收顺序回填整条链,无需手工操作;迁移可重复执行(幂等)。
 
 ## 设计要点
@@ -162,6 +216,7 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
 - **完整性哈希链**:每条记录引用上一条哈希,写入与链字段更新在同一事务完成(`BEGIN IMMEDIATE` 保证并发下链头一致);`GET /integrity` 全链校验。
 - **时间比较**:`occurred_at` 归一化为 UTC ISO8601 字符串存储,范围查询走字典序比较,并建有索引。
 - **消费游标与租约**:每个 consumer 一行(`consumers` 表),保存已确认游标与当前租约(token、批次起止 seq、过期时间)。`pull` 在 `BEGIN IMMEDIATE` 事务内完成"判租约 → 取批次 → 写租约",与事件写入互斥,并发重复拉取只会得到同一个租约;`ack` 仅推进整批游标并清空租约,token 不符、过期或无租约一律 409。
+- **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -171,9 +226,10 @@ curl -X POST http://localhost:8000/consumers/worker-1/ack \
 | POST | `/events` | 接收单个事件(幂等) |
 | GET | `/events` | 时间范围分页查询(`from`/`to`/`page`/`page_size`) |
 | POST | `/replay` | 批量重放,按首次接收顺序输出 |
-| GET | `/integrity` | 校验完整性哈希链,返回 `verified`/`checked`/`first_break` |
+| GET | `/integrity` | 从链锚点校验完整性哈希链,返回 `verified`/`checked`/`first_break`/`anchor_seq` |
 | POST | `/consumers/{consumer_id}/pull` | 按首次接收顺序拉取并原子租用未确认事件(`limit`/`lease_seconds`) |
 | POST | `/consumers/{consumer_id}/ack` | 确认当前租约批次并推进游标;过期/伪造/旧 token 返回 409 |
+| POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。
